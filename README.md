@@ -46,6 +46,7 @@ The system was validated on workers of *Formica polyctena* and larvae of *Alphit
 
 - `Pi_Module3_Case (1).stl`  
   3D model of a case/mount for the Raspberry Pi Camera Module 3, allowing stable top‑down positioning above the experimental setup.
+  This is a modified version of a design by aldmodels on https://www.printables.com/model/768693-raspberry-pi-camera-case-for-cam-module-3/files
 
 - `README.md`  
   This file.
