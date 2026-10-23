@@ -3,137 +3,52 @@ library(survival)
 library(ggsurvfit)
 library(survminer)
 
-library(dplyr)
-library(survival)
-library(ggsurvfit)
-library(survminer)
+df <- assay2 # <- insert dataset here
 
-df <- dat_long
-
-# Filter species
-ant_desiccation <- df %>%
-  filter(plant == "E. cheiranthoides")
-
-# Convert repeated observations into one row per ant
-survival_data <- ant_desiccation %>%
-  group_by(plant_nmbr, species, plant) %>%
-  arrange(day) %>%
-  summarise(
-    time = ifelse(
-      any(value == 0),
-      min(day[value == 0]),
-      max(day)
-    ),
-    event = ifelse(any(value == 0), 1, 0),
-    .groups = "drop"
-  )
-
-# Look at the resulting survival data
-print(survival_data)
-
-# Kaplan-Meier model
-fit_desicc <- survfit2(
-  Surv(time, event) ~ species,
-  data = survival_data
-)
-
-# Plot
-ggsurvfit(fit_desicc, linewidth = 1) +
-  labs(
-    title = expression(
-      "Survival curve of " *
-        italic("P. napi") *
-        " vs " *
-        italic("P. rapae") *
-        " on " *
-        italic("E. cheiranthoides")
-    ),
-    x = "Time (days)",
-    y = "Survival probability",
-    color = "plant"
-  ) +
-  add_pvalue() +
-  scale_y_continuous(limits = c(0, 1)) +
-  add_confidence_interval() +
-  guides(
-    fill = "none"
-  ) +
-  theme(
-    legend.text = element_text(face = "italic")
-  )
-
-
-library(dplyr)
-library(survival)
-library(ggsurvfit)
-library(survminer)
-library(ggplot2)
-
-df <- dat_long
-
-# Convert repeated observations into one row per caterpillar
-survival_data <- df %>%
-  group_by(plant_nmbr, species, plant) %>%
-  arrange(day) %>%
-  summarise(
-    time = ifelse(
-      any(value == 0),
-      min(day[value == 0]),
-      max(day)
-    ),
-    event = ifelse(any(value == 0), 1, 0),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    group = interaction(species, plant, sep = " - ")
-  )
-
-# Inspect the survival data
-print(survival_data)
-
-# Kaplan-Meier model: all species-plant combinations
-fit_all <- survfit2(
-  Surv(time, event) ~ group,
-  data = survival_data
-)
-
-# Plot all four survival curves
-ggsurvfit(fit_all, linewidth = 1) +
-  labs(
-    title = "Survival on different host plants",
-    x = "Time (days)",
-    y = "Survival probability",
-    color = "Species and host plant"
-  ) +
-  scale_y_continuous(limits = c(0, 1)) +
-  scale_color_manual(
-    values = c(
-      "#0072B2",
-      "#D55E00",
-      "#009E73",
-      "#CC79A7"
-    ),
-    labels = c(
-      expression(italic("P. napi") ~ "on" ~ italic("B. oleracea")),
-      expression(italic("P. rapae") ~ "on" ~ italic("B. oleracea")),
-      expression(italic("P. napi") ~ "on" ~ italic("E. cheiranthoides")),
-      expression(italic("P. rapae") ~ "on" ~ italic("E. cheiranthoides"))
+  ant_surv <- df %>%   # <- use your long data frame name here
+    arrange(source_sheet, position, minutes) %>%      # <- What columns define a unique indiviual
+    group_by(source_sheet, position, species, treatment, nest, place, assay, climate) %>%              #add here what data you need
+    summarise(
+      time = if (any(score == 0)) min(minutes[score == 0]) else max(minutes),
+      status = as.integer(any(score == 0)),  # 1 = died, 0 = censored
+      .groups = "drop"
     )
-  ) +
-  guides(fill = "none") +
-  theme_classic() +
-  theme(
-    legend.text = element_text(face = "plain")
-  ) +
-  scale_x_continuous(
-    breaks = 0:11,
-    limits = c(0, 11)
-  )
+  
+  
+  
+#Filtering the data#
+  
+  ant_desiccation <- ant_surv %>%
+    filter(assay == "assay2")
+  
+
+  fit_desicc <- survfit2(Surv(time, status) ~ treatment, data = ant_desiccation)     #what to group by
+  
+  ggsurvfit(fit_desicc, linewidth = 1) +
+    labs(
+      title = "Kaplan Meier survival curve of 384 ants comparing control vs desiccation",
+      x = "Time since strart (min)",
+      y = "Survival probability"
+    ) +
+    add_pvalue() +
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_x_continuous(
+      breaks = seq(0, 5000, by = 1000)
+    ) +
+    coord_cartesian(xlim = c(0, 3000)) # <- range of the survival plot#
 
 
-# Pairwise log-rank tests between all groups
-pairwise_survdiff(
-  Surv(time, event) ~ group,
-  data = survival_data,
-  p.adjust.method = "none"
+# Use the same ant_desiccation data as before
+# ant_desiccation has: time, status, climate, ...
+
+# Global log-rank test (already implicit in add_pvalue())
+survdiff(Surv(time, status) ~ treatment, data = ant_desiccation)                   #what to group by
+
+# Pairwise log-rank tests between climates
+pairwise_results <- pairwise_survdiff(
+  Surv(time, status) ~ treatment,
+  data = ant_desiccation,
+  p.adjust.method = "bonferroni"   # or "BH", "holm", etc.
 )
+
+pairwise_results
