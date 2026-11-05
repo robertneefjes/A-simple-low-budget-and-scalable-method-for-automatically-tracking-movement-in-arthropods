@@ -3,6 +3,7 @@
 import time
 import csv
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -15,9 +16,13 @@ from libcamera import controls
 # USER SETTINGS
 # =====================
 
-CAPTURE_INTERVAL_SECONDS = 10 * 60      # 10 minutes between frames
-IMAGE_SAVE_INTERVAL_SECONDS = 30 * 60   # 30 minutes between saved JPEGs
-PREVIEW_SCALE = 0.25                    # scale factor for preview windows
+# These are configured interactively at startup.
+# Multiple capture intervals are supported, e.g. [10, 60, 600, 1800].
+CAPTURE_INTERVALS_SECONDS = [10 * 60]
+IMAGE_SAVE_INTERVAL_SECONDS = 30 * 60
+
+PREVIEW_SCALE = 0.25          # main live preview
+SETUP_PREVIEW_SCALE = 0.5     # ROI setup preview (larger so lines are clearer)
 
 ROWS = 16
 COLS = 6
@@ -44,6 +49,7 @@ CAMERA_CONFIGS = [
 # =====================
 
 BACKUP_ENABLED = True
+BACKUP_INTERVAL_SECONDS = 5 * 60  # configured interactively at startup
 RCLONE_REMOTE = "antbackup"           # name of your rclone remote
 REMOTE_BASE_DIR = "ant_experiment"    # base folder on Google Drive
 
@@ -99,11 +105,10 @@ class CameraMonitor:
         self.image_dir = self.base_dir / "images"
         self.image_dir.mkdir(parents=True, exist_ok=True)
 
-        self.csv_path = self.base_dir / "movement_log.csv"
-        self.csv_file = open(self.csv_path, "w", newline="")
-        self.csv_writer = csv.writer(self.csv_file)
-        # CSV header will be written after metadata (set_metadata) is called
-        # because ROI codes depend on treatment, device, date.
+        # One CSV file and writer per configured movement interval.
+        # Headers are created in set_metadata(), after ROI codes are known.
+        self.csv_files = {}
+        self.csv_writers = {}
 
         # Camera setup
         self.picam = Picamera2(cam_index)
@@ -142,18 +147,16 @@ class CameraMonitor:
         self.crop_w = self.frame_width
         self.crop_h = self.frame_height
 
-        self.set_default_crop()   # sets crop_x/y/w/h and ROIS
-
         # Row layout factors: 0..1 positions within the crop (top to bottom)
         self.row_factors = [r / ROWS for r in range(ROWS + 1)]
-        self.update_rois()
+        self.set_default_crop()   # sets crop_x/y/w/h and ROIS (and resets row_factors)
 
-        # Previous frame (blurred grayscale) for motion diff
-        prev_gray = cv2.cvtColor(first_rgb, cv2.COLOR_RGB2GRAY)
-        self.prev_gray = cv2.GaussianBlur(prev_gray, BLUR_KERNEL_SIZE, 0)
-
-        # For image-saving interval
-        self.last_image_save = time.time()
+        # Each interval gets its own previous frame and measurement clock.
+        first_gray = cv2.cvtColor(first_rgb, cv2.COLOR_RGB2GRAY)
+        first_gray = cv2.GaussianBlur(first_gray, BLUR_KERNEL_SIZE, 0)
+        self.interval_prev_gray = {}
+        self.interval_next_measurement = {}
+        self.last_image_save = time.monotonic()
 
         # Metadata placeholders
         self.device_id = None
@@ -183,6 +186,7 @@ class CameraMonitor:
     def set_default_crop(self):
         """
         Set crop rectangle to a centered 3:2 region and update ROIs.
+        Also resets row_factors to equal rows.
         """
         target_aspect = 3 / 2
         fw, fh = self.frame_width, self.frame_height
@@ -312,10 +316,18 @@ class CameraMonitor:
         self._lock_exposure_from_metadata(meta)
         print(f"[{self.label}] Exposure/white balance re-locked for {mode_label}.")
 
-        # Refresh prev_gray to avoid huge diff after exposure jump
+        # Reset every interval's reference frame after the lighting change.
+        # This prevents the exposure transition from being counted as movement.
         frame_rgb = self.picam.capture_array("main")
         frame_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-        self.prev_gray = cv2.GaussianBlur(frame_gray, BLUR_KERNEL_SIZE, 0)
+        frame_gray = cv2.GaussianBlur(frame_gray, BLUR_KERNEL_SIZE, 0)
+        now_mono = time.monotonic()
+        self.interval_prev_gray = {
+            interval: frame_gray.copy() for interval in CAPTURE_INTERVALS_SECONDS
+        }
+        self.interval_next_measurement = {
+            interval: now_mono + interval for interval in CAPTURE_INTERVALS_SECONDS
+        }
 
     def set_metadata(self, device_id: int, treatment: str, run_date: str):
         """
@@ -370,45 +382,97 @@ class CameraMonitor:
         self.roi_labels = roi_labels
         self.roi_codes = roi_codes
 
-        # If CSV header not written yet, write it now
-        if self.csv_file and self.csv_file.tell() == 0:
-            header_rois = [f"{code}_score" for code in self.roi_codes]
-            self.csv_writer.writerow(["timestamp"] + header_rois + ["image_saved"])
-            self.csv_file.flush()
+        # Create one independent CSV for every capture interval.
+        header_rois = [f"{code}_score" for code in self.roi_codes]
+        for interval in CAPTURE_INTERVALS_SECONDS:
+            csv_path = self.base_dir / f"movement_{interval}s.csv"
+            csv_file = open(csv_path, "w", newline="")
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(["timestamp"] + header_rois + ["image_saved"])
+            csv_file.flush()
+            self.csv_files[interval] = csv_file
+            self.csv_writers[interval] = csv_writer
+
+    def start_measurements(self):
+        """Set a fresh reference frame and start all interval clocks."""
+        frame_rgb = self.picam.capture_array("main")
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, BLUR_KERNEL_SIZE, 0)
+        now_mono = time.monotonic()
+        self.interval_prev_gray = {
+            interval: gray.copy() for interval in CAPTURE_INTERVALS_SECONDS
+        }
+        self.interval_next_measurement = {
+            interval: now_mono + interval for interval in CAPTURE_INTERVALS_SECONDS
+        }
+        self.last_image_save = now_mono
 
     def process_frame(self, timestamp_iso: str, diff_threshold: int):
-        """
-        Capture one frame, compare to previous, update state, and return:
-          - movement_scores (list per ROI)
-          - image_saved (bool)
-          - overlay_preview (RGB with ROI grid)
-          - diff_preview (binary diff image)
-        Uses diff_threshold passed in (depends on visible vs IR).
-        """
-        # Capture current frame
-        frame_rgb = self.picam.capture_array("main")
+        """Capture one frame and process every interval that is due.
 
-        # Convert to grayscale and blur
+        Each interval compares the current frame with its own previous
+        reference frame. Independent absolute deadlines keep intervals
+        separate; missed deadlines are skipped rather than causing catch-up
+        bursts. The shortest interval determines the camera capture cadence.
+        """
+        frame_rgb = self.picam.capture_array("main")
         frame_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         frame_gray = cv2.GaussianBlur(frame_gray, BLUR_KERNEL_SIZE, 0)
+        now_mono = time.monotonic()
 
-        # Full-frame difference vs previous frame
-        diff = cv2.absdiff(frame_gray, self.prev_gray)
+        # Save JPEGs independently of the movement-measurement intervals.
+        image_saved = False
+        if now_mono - self.last_image_save >= IMAGE_SAVE_INTERVAL_SECONDS:
+            img_name = self.image_dir / (
+                f"{self.label}_frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+            if cv2.imwrite(str(img_name), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)):
+                image_saved = True
+                self.last_image_save = now_mono
+                print(f"[{self.label}] Saved image: {img_name.name}")
+            else:
+                print(f"[{self.label}] WARNING: could not save image {img_name}")
 
-        # Threshold to binary change image using current diff_threshold
-        _, diff_binary = cv2.threshold(
-            diff, diff_threshold, 255, cv2.THRESH_BINARY
-        )
+        # The shortest interval is used for the live binary-difference preview.
+        diff_binary_for_preview = np.zeros(frame_gray.shape, dtype=np.uint8)
 
-        # Per-ROI movement scores (count changed pixels)
-        movement_scores = []
-        for (x1, y1, x2, y2) in self.ROIS:
-            roi_thresh = diff_binary[y1:y2, x1:x2]
-            score = int(np.count_nonzero(roi_thresh))
-            movement_scores.append(score)
+        for interval in CAPTURE_INTERVALS_SECONDS:
+            if now_mono < self.interval_next_measurement[interval]:
+                continue
 
-        # Update previous frame
-        self.prev_gray = frame_gray
+            diff = cv2.absdiff(frame_gray, self.interval_prev_gray[interval])
+            _, diff_binary = cv2.threshold(
+                diff, diff_threshold, 255, cv2.THRESH_BINARY
+            )
+
+            movement_scores = []
+            for (x1, y1, x2, y2) in self.ROIS:
+                roi_thresh = diff_binary[y1:y2, x1:x2]
+                movement_scores.append(int(np.count_nonzero(roi_thresh)))
+
+            # Update only this interval's reference frame and clock.
+            self.interval_prev_gray[interval] = frame_gray.copy()
+            next_due = self.interval_next_measurement[interval] + interval
+            while next_due <= now_mono:
+                next_due += interval
+            self.interval_next_measurement[interval] = next_due
+
+            writer = self.csv_writers[interval]
+            csv_file = self.csv_files[interval]
+            writer.writerow([timestamp_iso] + movement_scores + [image_saved])
+            csv_file.flush()
+
+            print(
+                f"{timestamp_iso} | {self.label} | interval={interval}s | "
+                f"diff_threshold={diff_threshold} | image_saved={image_saved}"
+            )
+            for row in range(ROWS):
+                row_vals = movement_scores[row * COLS:(row + 1) * COLS]
+                print(" ".join(f"{v:6d}" for v in row_vals))
+            print("-" * 60)
+
+            if interval == min(CAPTURE_INTERVALS_SECONDS):
+                diff_binary_for_preview = diff_binary
 
         # Create overlay with ROI grid for preview
         overlay = frame_rgb.copy()
@@ -418,7 +482,7 @@ class CameraMonitor:
                 (x1, y1),
                 (x2, y2),
                 (0, 255, 0),
-                8,  # thicker lines for better visibility
+                12,  # thicker lines for better visibility in main preview
                 lineType=cv2.LINE_AA
             )
             if hasattr(self, "roi_labels") and 0 <= i < len(self.roi_labels):
@@ -454,38 +518,19 @@ class CameraMonitor:
             interpolation=cv2.INTER_NEAREST
         )
         diff_preview = cv2.resize(
-            diff_binary,
+            diff_binary_for_preview,
             (0, 0),
             fx=PREVIEW_SCALE,
             fy=PREVIEW_SCALE,
             interpolation=cv2.INTER_NEAREST
         )
 
-        # Save JPEG every IMAGE_SAVE_INTERVAL_SECONDS
-        image_saved = False
-        now = time.time()
-        if now - self.last_image_save >= IMAGE_SAVE_INTERVAL_SECONDS:
-            img_name = self.image_dir / f"{self.label}_frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            cv2.imwrite(str(img_name), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-            self.last_image_save = now
-            image_saved = True
-
-        # Write CSV row
-        self.csv_writer.writerow([timestamp_iso] + movement_scores + [image_saved])
-        self.csv_file.flush()
-
-        # Print matrix of ROI values (still numeric, row-major)
-        print(f"{timestamp_iso} | {self.label} | diff_threshold={diff_threshold}")
-        for row in range(ROWS):
-            row_vals = movement_scores[row * COLS:(row + 1) * COLS]
-            print(" ".join(f"{v:6d}" for v in row_vals))
-        print("-" * 60)
-
-        return movement_scores, image_saved, overlay_preview, diff_preview
+        return image_saved, overlay_preview, diff_preview
 
     def close(self):
         self.picam.stop()
-        self.csv_file.close()
+        for csv_file in self.csv_files.values():
+            csv_file.close()
 
 
 # =====================
@@ -510,6 +555,49 @@ def do_backup(tag: str):
         print(f"{tag} | Backup completed to {remote_path}")
     except subprocess.CalledProcessError as e:
         print(f"{tag} | Backup FAILED: {e}")
+
+
+class BackupManager:
+    """Run periodic rclone syncs away from the camera-capture thread."""
+
+    def __init__(self, interval_seconds: int):
+        self.interval_seconds = interval_seconds
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.backup_lock = threading.Lock()
+
+    def _run(self):
+        # Do one initial sync, then wait the configured interval between starts.
+        while not self.stop_event.is_set():
+            if self.backup_lock.acquire(blocking=False):
+                try:
+                    do_backup("SCHEDULED")
+                finally:
+                    self.backup_lock.release()
+            else:
+                print("SCHEDULED | Backup skipped because another backup is still running")
+
+            if self.stop_event.wait(self.interval_seconds):
+                break
+
+    def start(self):
+        if self.interval_seconds <= 0:
+            return
+        self.thread = threading.Thread(
+            target=self._run,
+            name="rclone-backup",
+            daemon=True
+        )
+        self.thread.start()
+
+    def stop_and_wait(self):
+        """Stop future scheduled syncs and wait for an active sync to finish."""
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join()
+        # Acquire/release ensures no background sync is still active.
+        with self.backup_lock:
+            pass
 
 
 def get_light_mode(now: datetime) -> str:
@@ -631,7 +719,7 @@ def run_roi_setup_single(mon: CameraMonitor):
                 (x1, y1),
                 (x2, y2),
                 color,
-                4,
+                8,   # thicker lines in setup view
                 lineType=cv2.LINE_AA
             )
             label = mon.roi_labels[idx] if hasattr(mon, "roi_labels") else str(idx)
@@ -665,7 +753,7 @@ def run_roi_setup_single(mon: CameraMonitor):
                 (int(mon.crop_x), y),
                 (int(mon.crop_x + mon.crop_w), y),
                 (0, 0, 255),
-                3,
+                6,
                 lineType=cv2.LINE_AA
             )
             status_text = f"Boundary between rows {selected_boundary} and {selected_boundary+1}"
@@ -694,8 +782,8 @@ def run_roi_setup_single(mon: CameraMonitor):
         preview = cv2.resize(
             overlay,
             (0, 0),
-            fx=PREVIEW_SCALE,
-            fy=PREVIEW_SCALE,
+            fx=SETUP_PREVIEW_SCALE,
+            fy=SETUP_PREVIEW_SCALE,
             interpolation=cv2.INTER_NEAREST
         )
         cv2.imshow(f"{mon.label} ROI setup", preview)
@@ -781,8 +869,71 @@ def collect_experiment_metadata(monitors):
     and configures each monitor with metadata (ROI labels/codes).
     """
     global DEVICE_ID, DAY_START_HOUR, NIGHT_START_HOUR, CAMERA_TREATMENTS
+    global CAPTURE_INTERVALS_SECONDS, IMAGE_SAVE_INTERVAL_SECONDS
 
     print("\n=== Ant Experiment Setup ===")
+
+    # Capture intervals: accept any number of unique positive whole seconds.
+    print("\n=== Capture Interval Setup ===")
+    print("Enter one or more intervals in seconds, separated by commas.")
+    print("Example: 10, 60, 600, 1800")
+    while True:
+        raw = input("Capture intervals in seconds (default 600): ").strip()
+        if raw == "":
+            CAPTURE_INTERVALS_SECONDS = [600]
+            break
+        try:
+            values = [int(part.strip()) for part in raw.split(",")]
+            if not values or any(value <= 0 for value in values):
+                raise ValueError
+            if len(values) != len(set(values)):
+                print("Please do not enter duplicate intervals.")
+                continue
+            CAPTURE_INTERVALS_SECONDS = sorted(values)
+            break
+        except ValueError:
+            print("Please enter positive whole numbers separated by commas, e.g. 10, 60, 600.")
+
+    print("Active capture intervals:", ", ".join(f"{v}s" for v in CAPTURE_INTERVALS_SECONDS))
+
+    # JPEG image-saving interval.
+    while True:
+        raw = input("How often should JPEG images be saved, in seconds (default 1800): ").strip()
+        if raw == "":
+            IMAGE_SAVE_INTERVAL_SECONDS = 1800
+            break
+        try:
+            value = int(raw)
+            if value > 0:
+                IMAGE_SAVE_INTERVAL_SECONDS = value
+                break
+        except ValueError:
+            pass
+        print("Please enter a positive whole number of seconds.")
+
+    print(f"JPEG saving interval: {IMAGE_SAVE_INTERVAL_SECONDS}s")
+
+    # Backup interval. Backups run in a separate background thread so rclone
+    # cannot block camera capture and movement measurements.
+    global BACKUP_INTERVAL_SECONDS
+    if BACKUP_ENABLED:
+        while True:
+            raw = input("How often should backups run, in seconds (default 300; 0 disables scheduled backups): ").strip()
+            if raw == "":
+                BACKUP_INTERVAL_SECONDS = 300
+                break
+            try:
+                value = int(raw)
+                if value >= 0:
+                    BACKUP_INTERVAL_SECONDS = value
+                    break
+            except ValueError:
+                pass
+            print("Please enter 0 or a positive whole number of seconds.")
+        if BACKUP_INTERVAL_SECONDS == 0:
+            print("Scheduled backups disabled; a final backup will still run when the program stops.")
+        else:
+            print(f"Scheduled backup interval: {BACKUP_INTERVAL_SECONDS}s")
 
     # Device ID
     while True:
@@ -834,6 +985,10 @@ def collect_experiment_metadata(monitors):
     print(f"  Run ID         : {RUN_ID}")
     print(f"  Device ID      : {DEVICE_ID}")
     print(f"  Day visible    : {DAY_START_HOUR:02d}:00 – {NIGHT_START_HOUR:02d}:00")
+    print(f"  Capture intervals: {', '.join(str(v) + 's' for v in CAPTURE_INTERVALS_SECONDS)}")
+    print(f"  JPEG save interval: {IMAGE_SAVE_INTERVAL_SECONDS}s")
+    if BACKUP_ENABLED:
+        print(f"  Backup interval   : {BACKUP_INTERVAL_SECONDS}s" if BACKUP_INTERVAL_SECONDS > 0 else "  Scheduled backups : disabled (final backup still enabled)")
     for mon in monitors:
         print(f"  Camera {mon.label}: treatment='{mon.treatment}', example ROI label='{mon.roi_labels[0]}'")
 
@@ -844,33 +999,45 @@ def collect_experiment_metadata(monitors):
     print("  1: Edit ROIs for cam0")
     print("  2: Edit ROIs for cam1")
     print("  3: Edit ROIs for both (one after the other)")
-    print("  s: Skip ROI editing and start immediately")
+    print("  s: Start experiment (no more ROI changes)")
     print("  q: Quit without starting")
 
     while True:
         choice = input("Select option [1/2/3/s/q]: ").strip().lower()
+
         if choice == "1":
+            # Edit only cam0, then return to this menu
             if len(monitors) >= 1:
                 if not run_roi_setup_single(monitors[0]):
                     return False
-            break
+            print("Finished editing cam0 ROIs. You can edit another camera or press 's' to start.")
+            continue
+
         elif choice == "2":
+            # Edit only cam1, then return to this menu
             if len(monitors) > 1:
                 if not run_roi_setup_single(monitors[1]):
                     return False
+                print("Finished editing cam1 ROIs. You can edit another camera or press 's' to start.")
             else:
                 print("No second camera configured.")
-            break
+            continue
+
         elif choice == "3":
+            # Edit both cameras sequentially, then return to this menu
             for mon in monitors:
                 if not run_roi_setup_single(mon):
                     return False
-            break
+            print("Finished editing ROIs for all cameras. You can edit again or press 's' to start.")
+            continue
+
         elif choice == "s":
-            # no ROI editing
+            # Start experiment
             break
+
         elif choice == "q":
             return False
+
         else:
             print("Please choose 1, 2, 3, s, or q.")
 
@@ -901,6 +1068,15 @@ if not ok:
 
 print("Press 'q' in a preview window or Ctrl+C in the terminal to stop.")
 
+# Start all interval clocks from the same point after setup is complete.
+for mon in monitors:
+    mon.start_measurements()
+
+backup_manager = None
+if BACKUP_ENABLED and BACKUP_INTERVAL_SECONDS > 0:
+    backup_manager = BackupManager(BACKUP_INTERVAL_SECONDS)
+    backup_manager.start()
+
 # Initial light mode based on current time
 now = datetime.now()
 current_light_mode = get_light_mode(now)
@@ -913,9 +1089,10 @@ last_wifi_check = 0
 # MAIN LOOP
 # =====================
 
+next_capture_deadline = time.monotonic() + min(CAPTURE_INTERVALS_SECONDS)
+
 try:
     while True:
-        loop_start = time.time()
         now = datetime.now()
         timestamp_iso = now.isoformat()
 
@@ -940,7 +1117,7 @@ try:
 
         # Process each camera
         for mon in monitors:
-            _, _, overlay_preview, diff_preview = mon.process_frame(
+            _, overlay_preview, diff_preview = mon.process_frame(
                 timestamp_iso,
                 diff_threshold=current_diff_threshold
             )
@@ -954,20 +1131,21 @@ try:
             print("Quit requested from window.")
             break
 
-        # Backup once per cycle (both cameras)
-        if BACKUP_ENABLED:
-            do_backup(timestamp_iso)
-
-        # Maintain capture interval
-        elapsed = time.time() - loop_start
-        sleep_time = CAPTURE_INTERVAL_SECONDS - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        # Keep the capture cadence anchored to fixed deadlines. If processing
+        # overruns, skip missed ticks rather than drifting or taking catch-up bursts.
+        next_capture_deadline += min(CAPTURE_INTERVALS_SECONDS)
+        now_mono = time.monotonic()
+        while next_capture_deadline <= now_mono:
+            next_capture_deadline += min(CAPTURE_INTERVALS_SECONDS)
+        time.sleep(max(0.0, next_capture_deadline - time.monotonic()))
 
 except KeyboardInterrupt:
     print("\nStopped by user.")
 
 finally:
+    if backup_manager is not None:
+        backup_manager.stop_and_wait()
+
     for mon in monitors:
         mon.close()
 
